@@ -1,0 +1,1169 @@
+//======================================================================
+// 分析を行う分析エージェントクラス
+//----------------------------------------------------------------------
+//  SYSTEM    : Clinical Karte Search
+//  SUB SYSTEM: Clinical Karte Search Core
+//  FILE      : SearchAgent.cs
+//----------------------------------------------------------------------
+//  Copyright(C) 2005-2013 株式会社 医用工学研究所. All rights reserved.
+//======================================================================
+using System;
+using System.Data;
+using System.IO;
+using System.Threading;
+using System.Text;
+using MEI.Library.CanDb;
+using System.Xml.Serialization;
+using System.Configuration;
+using ClinicalDataAnalyzer.RemoteInterfaces;
+using System.Collections;
+using ClinicalDataAnalyzer.ArcLib;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace ClinicalKarteSearch.Core
+{
+	/// <summary>
+	/// 非同期用デリゲート
+	/// </summary>
+    delegate CANWErr MyDelegate(string param1, long param3, long param4, long param5, string param6, byte[] param7, string param8);
+	
+	/// <summary>
+	/// 分析エージェント
+	/// </summary>
+	public class SearchAgent
+	{
+		int				m_dataCnt;
+		DateTime		m_accessDate;
+		int				m_maxDataCnt;
+		bool			m_tooLargeRequestStatus;
+        bool            m_errStatus;		// @@ : 追加
+        string          m_errMessage;		// @@ : 追加
+        bool			m_cancelStatus;
+		int				m_maxSqlLength;
+		int				m_divisionCnt;
+		int				m_divisionRange;
+		long			m_searchHistoryId;
+
+		MyDelegate		m_searchDelegate;
+		IAsyncResult	m_iAsyncResult;
+
+		/// <summary>
+		/// コンストラクタ
+		/// </summary>
+		public SearchAgent()
+		{
+			//初期化
+			Initialize();
+		}
+
+		/// <summary>
+		/// 初期化
+		/// </summary>
+		private void Initialize()
+		{
+			m_dataCnt = 0;
+			m_accessDate = DateTime.Now;
+			m_searchDelegate = null;
+			m_iAsyncResult = null;
+			m_tooLargeRequestStatus = false;
+            m_errStatus = false;		// @@ : 追加
+            m_errMessage = "";			// @@ : 追加
+            m_cancelStatus = false;
+			m_maxSqlLength = 0;
+			m_divisionCnt = 1;
+			m_divisionRange = 0;
+			m_searchHistoryId = 0;
+		}
+
+		/// <summary>
+		/// アクセス日時
+		/// </summary>
+		public DateTime AccessDate
+		{
+			get
+			{
+				return m_accessDate;
+			}
+		}
+
+		/// <summary>
+		/// 分析Agentの更新
+		/// </summary>
+		private void UpdateAccessDate()
+		{
+			m_accessDate = DateTime.Now;
+		}
+
+		/// <summary>
+		/// カルテ検索処理を開始する
+		/// </summary>
+		/// <param name="sessionId">セッションID</param>
+		/// <param name="searchHistoryId">検索履歴ID</param>
+		/// <param name="maxDataCnt">最大レコード件数(設定値)</param>
+		/// <returns>CANWErr</returns>
+        public CANWErr ExecuteKarteSearch(string sessionId, long analyzeConfigId, long searchHistoryId, long userId, string loginId, byte[] searchSettingComp, int maxDataCnt, string ipAddress)
+		{
+			CANWErr err = new CANWErr(CANWErrCode.Success);
+			m_maxDataCnt = maxDataCnt;
+
+			try
+			{
+				// 現在の日時をアクセス情報として残す
+				UpdateAccessDate();
+				// 検索が始まっているかどうか
+				if (m_iAsyncResult == null)
+				{
+					m_maxSqlLength = int.Parse(System.Configuration.ConfigurationManager.AppSettings["MaxSqlLength"]);
+					m_divisionRange = int.Parse(System.Configuration.ConfigurationManager.AppSettings["DivisionRange"]);
+					// デリゲートの作成及び非同期処理の開始
+					m_searchHistoryId = searchHistoryId;
+					m_searchDelegate = new MyDelegate(this.KarteSearchProc);
+                    m_iAsyncResult = m_searchDelegate.BeginInvoke(sessionId, analyzeConfigId, searchHistoryId, userId, loginId, searchSettingComp, ipAddress, null, null);
+				}
+				else
+				{
+					err.Code = CANWErrCode.AlreadySearch;
+				}
+			}
+			catch (Exception ex)
+			{
+				err.Code = CANWErrCode.System;
+				err.Message = ex.Message;
+			}
+			return err;
+        }
+
+        /// <summary>
+        /// カルテ検索処理を開始する
+        /// </summary>
+        /// <param name="sessionId">セッションID</param>
+        /// <param name="searchHistoryId">検索履歴ID</param>
+        /// <param name="maxDataCnt">最大レコード件数(設定値)</param>
+        /// <returns>CANWErr</returns>
+        public CANWErr ExecuteFocusSearch(string sessionId, long analyzeConfigId, long searchHistoryId, long userId, string loginId, byte[] searchSettingComp, int maxDataCnt, string ipAddress)
+        {
+            CANWErr err = new CANWErr(CANWErrCode.Success);
+            m_maxDataCnt = maxDataCnt;
+
+            try
+            {
+                // 現在の日時をアクセス情報として残す
+                UpdateAccessDate();
+                // 検索が始まっているかどうか
+                if (m_iAsyncResult == null)
+                {
+					m_maxSqlLength = int.Parse(System.Configuration.ConfigurationManager.AppSettings["MaxSqlLength"]);
+					m_divisionRange = int.Parse(System.Configuration.ConfigurationManager.AppSettings["DivisionRange"]);
+                    // デリゲートの作成及び非同期処理の開始
+                    m_searchHistoryId = searchHistoryId;
+                    m_searchDelegate = new MyDelegate(this.FocusSearchProc);
+                    m_iAsyncResult = m_searchDelegate.BeginInvoke(sessionId, analyzeConfigId, searchHistoryId, userId, loginId, searchSettingComp, ipAddress, null, null);
+                }
+                else
+                {
+                    err.Code = CANWErrCode.AlreadySearch;
+                }
+            }
+            catch (Exception ex)
+            {
+                err.Code = CANWErrCode.System;
+                err.Message = ex.Message;
+            }
+            return err;
+        }
+
+		/// <summary>
+		/// 検索処理の進捗をチェックする
+		/// </summary>
+		/// <param name="sessionId">セッションID</param>
+		/// <param name="dataCnt">検索結果のレコード件数</param>
+		/// <param name="divisionCnt">検索結果の分割数</param>
+		/// <returns>CANWErr</returns>
+		public CANWErr CheckSearchFirstProc(string sessionId, out int dataCnt, out int divisionCnt)
+		{
+			CANWErr err = new CANWErr(CANWErrCode.Success);
+
+			dataCnt = 0;
+			divisionCnt = 0;
+			try
+			{
+				// 現在の日時をアクセス日時として残す
+				UpdateAccessDate();
+
+				// 検索が始まっているかどうか
+				if (m_iAsyncResult == null)
+				{
+					err.Code = CANWErrCode.NoSearch;
+				}
+				// 検索SQLが長すぎる
+				else if (m_tooLargeRequestStatus)
+				{
+					err.Code = CANWErrCode.TooLargeRequest;
+				}
+				// 検索結果が多すぎる
+				else if (m_dataCnt > m_maxDataCnt)
+				{
+					err.Code = CANWErrCode.TooManyDataCnt;
+					dataCnt = m_dataCnt;
+				}
+				// 検索実行中（件数取得中）
+				else if (!m_iAsyncResult.IsCompleted)
+				{
+					err.Code = CANWErrCode.StillSearch;
+                }
+                // 検索実行時に例外発生しているかどうか（ProcがCompletedしていて、StillSearchではなく、エラーステータスがTrueになっている場合）
+                else if (m_errStatus)							// @@ : 追加
+                {												// @@ : 追加
+                    err.Code = CANWErrCode.System;				// @@ : 追加
+                    err.Message = m_errMessage;					// @@ : 追加
+                }												// @@ : 追加
+				// 検索実行完了以降の状態
+				else 
+				{
+					dataCnt = m_dataCnt;
+					divisionCnt = m_divisionCnt;
+				}
+			}
+			catch (CanDbException ex)
+			{
+				// note : DB2対応の場合コストの高いSQLを処理した場合処理がタイムアウトしてこの
+				// 例外が投げられる恐れがあるため対応する
+				if ((ex.Errors[0] != null) && (ex.Errors[0].SQLState == "HY008"))
+				{
+					err.Code = CANWErrCode.Timeout;
+					err.Message = ex.Message;
+				}
+				else
+				{
+					err.Code = CANWErrCode.System;
+					err.Message = ex.Message;
+				}
+			}
+			catch (Exception ex)
+			{
+				err.Code = CANWErrCode.System;
+				err.Message = ex.Message;
+			}
+			return err;
+		}
+
+		/// <summary>
+		/// 検索処理をキャンセルする
+		/// </summary>
+		/// <returns></returns>
+		public CANWErr CancelSearch(out long searchHistoryId)
+		{
+			CANWErr err = new CANWErr(CANWErrCode.Success);
+
+			try
+			{
+				// 現在の日時をアクセス情報として残す
+				UpdateAccessDate();
+
+				// 分析が始まっているかどうか
+				if (m_iAsyncResult == null)
+				{
+					err.Code = CANWErrCode.NoSearch;
+				}
+				else
+				{
+					m_cancelStatus = true;
+					err = m_searchDelegate.EndInvoke(m_iAsyncResult);
+				}
+			}
+			catch (Exception ex)
+			{
+				err.Code = CANWErrCode.System;
+				err.Message = ex.Message;
+			}
+			finally
+			{
+				searchHistoryId = m_searchHistoryId;
+			}
+			return err;
+		}
+
+		/// <summary>
+		/// 検索処理を終了する
+		/// </summary>
+		/// <returns></returns>
+		public CANWErr GetSearchResult(out long searchHistoryId)
+		{
+			CANWErr err = new CANWErr(CANWErrCode.Success);
+
+			try
+			{
+				// 現在の日時をアクセス情報として残す
+				UpdateAccessDate();
+
+				// 検索エージェントを破棄する
+				if (m_iAsyncResult != null)
+				{
+					m_cancelStatus = true;
+					err = m_searchDelegate.EndInvoke(m_iAsyncResult);
+				}
+			}
+			catch (Exception ex)
+			{
+				err.Code = CANWErrCode.System;
+				err.Message = ex.Message;
+			}
+			finally
+			{
+				searchHistoryId = m_searchHistoryId;
+			}
+			return err;
+		}
+        
+        /// <summary>
+        /// カルテ検索を行う
+        /// note : デリゲートを用い非同期呼び出しします
+        /// </summary>
+        /// <param name="sessionId">セッションID</param>
+        /// <param name="analyzeConfigId">検索テンプレートID（あれば）</param>
+        /// <param name="searchHistoryId">検索履歴ID</param>
+        /// <param name="userId">ユーザーID</param>
+        /// <param name="loginId">ログインID</param>
+        /// <param name="searchSettingComp">検索セット</param>
+        /// <returns>CANWErr</returns>
+        private CANWErr KarteSearchProc(string sessionId, long analyzeConfigId, long searchHistoryId, long userId, string loginId, byte[] searchSettingComp, string ipAddress)
+		{
+            return SearchProc(sessionId, KarteSearchTypeEnum.KarteSearch, analyzeConfigId, searchHistoryId, userId, loginId, searchSettingComp, ipAddress);
+        }
+
+        /// <summary>
+        /// フォーカス検索を行う
+        /// note : デリゲートを用い非同期呼び出しします
+        /// </summary>
+        /// <param name="sessionId">セッションID</param>
+        /// <param name="analyzeConfigId">検索テンプレートID（あれば）</param>
+        /// <param name="searchHistoryId">検索履歴ID</param>
+        /// <param name="userId">ユーザーID</param>
+        /// <param name="loginId">ログインID</param>
+        /// <param name="searchSettingComp">検索セット</param>
+        /// <returns>CANWErr</returns>
+        private CANWErr FocusSearchProc(string sessionId, long analyzeConfigId, long searchHistoryId, long userId, string loginId, byte[] searchSettingComp, string ipAddress)
+        {
+            return SearchProc(sessionId, KarteSearchTypeEnum.FocusSearch, analyzeConfigId, searchHistoryId, userId, loginId, searchSettingComp, ipAddress);
+        }
+        
+        /// <summary>
+        /// 検索を行う
+        /// </summary>
+        /// <param name="sessionId">セッションID</param>
+        /// <param name="searchType">検索種類文字列（カルテ検索:"K", フォーカス検索:"F"）</param>
+        /// <param name="analyzeConfigId">検索テンプレートID（あれば）</param>
+        /// <param name="searchHistoryId">検索履歴ID</param>
+        /// <param name="userId">ユーザーID</param>
+        /// <param name="loginId">ログインID</param>
+        /// <param name="searchSettingComp">検索セット</param>
+        /// <returns>CANWErr</returns>
+        private CANWErr SearchProc(string sessionId, KarteSearchTypeEnum searchType, long analyzeConfigId, long searchHistoryId, long userId, string loginId, byte[] searchSettingComp, string ipAddress)
+        {
+			string				sql, cntSql;
+			KarteSearchSetting	karteSearchSetting;
+			SqlManager			sqlManager;
+			CanDbConnection		conn = new CanDbConnection(ClinicalKarteSearchCoreLibs.GetConnectionStringCan());
+			CanDbConnection		connWrite = new CanDbConnection(ClinicalKarteSearchCoreLibs.GetConnectionStringCan());
+			CanDbCommand		cmdRead;
+			CanDbCommand		cmdWrite;
+			CanDbDataAdapter	da = new CanDbDataAdapter();
+			CanDbDataReader		dr = null;
+			CANWErr				err = new CANWErr(CANWErrCode.Success);
+			DataSet				searchResultBuf = new DataSet();
+			byte[]				searchResultComp;
+			string[]			columnNameList, displayNameList;
+			int					col;
+			DataRow				dRow;
+			int					readCnt = 0;
+			int					writeCnt = 0; 
+			Encoding			sjisEnc = Encoding.GetEncoding("Shift_JIS");
+            string              searchResultKind = "";
+			CanDbConnection		connCnt = new CanDbConnection(ClinicalKarteSearchCoreLibs.GetConnectionStringCan());
+            CanDbCommand        cmdCnt;
+            CanDbDataReader     drCnt = null;
+            int                 dataCnt = 0;
+
+			try
+			{
+				conn.Open();
+				connWrite.Open();
+
+				// 検索セットを取得する
+                if (!ClinicalKarteSearchCoreLibs.GetSearchSetting(conn, sessionId, searchType, out karteSearchSetting))
+				{
+					err.Code = CANWErrCode.NoData;
+				}
+				else
+				{
+					cmdRead = new CanDbCommand("", conn, null);
+                    cmdWrite = new CanDbCommand("", connWrite, null);
+                    cmdCnt = new CanDbCommand("", conn, null);
+
+                    sqlManager = new SqlManager();
+
+					string[] targetColumnTypes;
+					string[] originalColumnTypes;
+					NumericDateTimeFormat[] numericDateTimeFormats;
+
+					// 表示名を取得しておく
+					GetDisplayNameList(conn, karteSearchSetting.TargetId, out columnNameList, out displayNameList, out targetColumnTypes,
+						out numericDateTimeFormats, out originalColumnTypes);
+
+					// SQLが不正である
+					if (!sqlManager.CreateSql(conn, karteSearchSetting, columnNameList.ToList(), originalColumnTypes, out sql, out cntSql))
+					{
+						err.Code = CANWErrCode.System;
+					}
+					// SQL文のバイト数が制限値を超えているかを調べる（ただし制限値が0の場合は制限なし）
+					else if (m_maxSqlLength > 0 && sjisEnc.GetByteCount(sql) > m_maxSqlLength)
+					{
+						m_tooLargeRequestStatus = true;
+					}
+					else
+					{
+                        cmdWrite.CommandText = "insert into SearchSqlLog_TBL (LogDate, LogType, SearchHistoryId, SearchOrder, TargetId, TargetDisplayName, UserId, UserName, IpAddress, SearchSql, ScreeningSql, LogMessage, CancelStatus, IsSearchResultSql) values (" + SqlLibs.GetSystemDateString() + ",?,?,?,?,?,?,?,?,?,?,?,?,?)";
+                        cmdWrite.Parameters.AddWithValue("@LogType", "INFO");
+                        cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+                        cmdWrite.Parameters.Add("@SearchOrder", CanDbType.Integer).Value = 0;
+                        cmdWrite.Parameters.Add("@TargetId", CanDbType.Integer).Value = karteSearchSetting.TargetId;
+                        cmdWrite.Parameters.AddWithValue("@TargetDisplayName", GetTargetDisplayName(conn, karteSearchSetting.TargetId));
+                        cmdWrite.Parameters.Add("@UserId", CanDbType.Integer).Value = userId;
+                        cmdWrite.Parameters.AddWithValue("@UserName", GetUserName(conn, userId));
+                        cmdWrite.Parameters.AddWithValue("@IpAddress", ipAddress);
+                        cmdWrite.Parameters.AddWithValue("@SearchSql", sql);
+                        cmdWrite.Parameters.AddWithValue("@ScreeningSql", "");
+                        cmdWrite.Parameters.AddWithValue("@LogMessage", "");
+                        cmdWrite.Parameters.AddWithValue("@CancelStatus", "N");
+                        cmdWrite.Parameters.AddWithValue("@IsSearchResultSql", "N");
+
+                        cmdWrite.ExecuteNonQuery();
+                        cmdWrite = new CanDbCommand("", conn, null);
+
+						// 件数を数える
+						cmdRead.Parameters.Clear();
+						cmdRead.CommandText = cntSql;
+						dr = cmdRead.ExecuteReader();
+						if (dr.HasRows && dr.Read() && !dr.IsDBNull(0))
+						{
+							m_dataCnt = int.Parse(dr[0].ToString());
+							dr.Close();
+							// 件数が上限を超えない場合
+							if (m_maxDataCnt >= m_dataCnt)
+							{
+								// 分割数を求める
+								if (m_dataCnt == 0)
+								{
+									m_divisionCnt = 1;
+								}
+								else if (m_dataCnt % m_divisionRange == 0)
+								{
+									m_divisionCnt = Convert.ToInt32(m_dataCnt / m_divisionRange);
+								}
+								else
+								{
+									m_divisionCnt = Convert.ToInt32(m_dataCnt / m_divisionRange) + 1;
+								}
+
+                                // KarteSearchHistory_TBLに追加する
+								cmdWrite.Parameters.Clear();
+                                cmdWrite.CommandText = "insert into KarteSearchHistory_TBL (SearchHistoryId, TargetId, UserId, Description, SearchType, IsLeave, DivisionCnt, AnalyzeConfigId, KarteSearchSetting, SearchDate, ModifiedDate, UserModified) values (?, ?, ?, ?, ?, ?, ?, ?, ?, " + SqlLibs.GetSystemDateString() + ", " + SqlLibs.GetSystemDateString() + ", ?)";
+								cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+                                cmdWrite.Parameters.Add("@TargetId", CanDbType.Integer).Value = karteSearchSetting.TargetId;
+								cmdWrite.Parameters.Add("@UserId", CanDbType.Integer).Value = userId;
+                                cmdWrite.Parameters.AddWithValue("@Description", ""); 
+                                if (searchType == KarteSearchTypeEnum.KarteSearch)
+                                    cmdWrite.Parameters.AddWithValue("@SearchType", "K");
+                                else if (searchType == KarteSearchTypeEnum.FocusSearch)
+                                    cmdWrite.Parameters.AddWithValue("@SearchType", "F");
+								cmdWrite.Parameters.AddWithValue("@IsLeave", "N");
+								cmdWrite.Parameters.Add("@DivisionCnt", CanDbType.Integer).Value = m_divisionCnt;
+                                cmdWrite.Parameters.Add("@AnalyzeConfigId", CanDbType.Integer).Value = analyzeConfigId;
+                                cmdWrite.Parameters.AddWithValue("@KarteSearchSetting", searchSettingComp);
+								cmdWrite.Parameters.AddWithValue("@UserModified", loginId);
+
+								if (cmdWrite.ExecuteNonQuery() >= 1)
+								{
+									// データセットに検索結果をセットする
+									cmdRead.Parameters.Clear();
+                                    cmdRead.CommandText = sql;
+                                    dr = cmdRead.ExecuteReader();
+
+                                    cmdCnt.Parameters.Clear();
+                                    cmdCnt.CommandText = sql;
+                                    drCnt = cmdCnt.ExecuteReader();
+
+                                    if (dr.HasRows)
+									{
+										// データセットをフォーマットする
+										CreateSearchResultBuff(dr, columnNameList, displayNameList, targetColumnTypes, numericDateTimeFormats, out searchResultBuf);
+										// 取得データ件数分でループ処理
+										readCnt = 0;
+
+                                        // 表示データカウント(検索結果種別判定用)
+                                        while (drCnt.Read())
+                                        {
+                                            dataCnt++;
+                                        }
+
+										while (dr.Read())
+                                        {
+                                            drCnt.Read();
+											if (!m_cancelStatus)
+											{
+												readCnt++;
+												// データセットに１レコード追加する
+												col = 0;
+												dRow = searchResultBuf.Tables[0].NewRow();
+
+                                                cmdWrite.CommandText = "insert into KarteSearchResultCache_TBL (SearchHistoryId, SearchResultOrder, SearchResult, SearchResultKind, UserModified) values (?, ?, ?, ?, ?)";
+												for (col = 0; col < searchResultBuf.Tables[0].Columns.Count; col++)
+												{
+                                                    // 検索結果データテーブルが DateTime 型の場合、SELECT 結果が数値の可能性があるため、必要であれば変換して格納
+                                                    if (searchResultBuf.Tables[0].Columns[col].DataType == typeof(DateTime))
+                                                    {
+                                                        // 項目名が一致する項目名一覧の場所を取得
+                                                        int index = columnNameList.ToList().IndexOf(searchResultBuf.Tables[0].Columns[col].ColumnName);
+                                                        // フォーマット指定なし、または NULL はそのままで良い。
+                                                        if (numericDateTimeFormats[index] == NumericDateTimeFormat.None ||
+                                                                dr.IsDBNull(col))
+                                                        {
+                                                            dRow[col] = dr[col];
+                                                        }
+                                                        // 数値を日付フォーマットを指定して日付型に変換して格納
+                                                        else
+                                                        {
+                                                            // 00-01-10 を数値(YY-MM-DD)で表すと 110 になってしまうため、その日時フォーマットに合わせた桁数になるまで 0 埋めする。
+                                                            dRow[col] = DateTime.ParseExact(dr[col].ToString().PadLeft(numericDateTimeFormats[index].ToString().Length, '0'), numericDateTimeFormats[index].ToString(), null);
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        // 文字列、数値はそのままで良い。
+                                                        dRow[col] = dr[col];
+                                                    }
+												}
+												searchResultBuf.Tables[0].Rows.Add(dRow);
+
+                                                //// 最初のカウント件数に達したら、もしくは分割の閾値に達したらKarteSearchResultCache_TBLに１レコード追加する
+                                                //@@ if (readCnt >= m_dataCnt || readCnt % m_divisionRange == 0)
+                                                // 分割の閾値に達したらKarteSearchResultCache_TBLに１レコード追加する
+												if (readCnt % m_divisionRange == 0)
+												{
+													TrimStringTypeColumn(searchResultBuf.Tables[0]);
+													if (CompressDataSet(searchResultBuf, out searchResultComp))
+													{
+														writeCnt++;
+
+                                                        // 検索結果種別を判定（N=Normal, F=Final)
+                                                        if (dataCnt > readCnt)
+                                                        {
+                                                            searchResultKind = "N";
+                                                        }
+                                                        else
+                                                        {
+                                                            searchResultKind = "F";
+                                                        }
+
+                                                        // 分割結果をKarteSearchResultCache_TBLに書き込む
+														cmdWrite.Parameters.Clear();
+														cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+														cmdWrite.Parameters.Add("@SearchResultOrder", CanDbType.Integer).Value = writeCnt;
+                                                        cmdWrite.Parameters.AddWithValue("@SearchResult", searchResultComp);
+                                                        cmdWrite.Parameters.AddWithValue("@SearchResultKind", searchResultKind);
+														cmdWrite.Parameters.AddWithValue("@UserModified", loginId.ToUpper());
+														cmdWrite.ExecuteNonQuery();
+
+														// 作業用のデータセットのレコードを削除
+														searchResultBuf.Tables[0].Rows.Clear();
+													}
+													else
+													{
+														err.Code = CANWErrCode.System;
+														break;
+													}
+												}
+												else
+												{
+													// 閾値の間のレコードのため処理継続
+												}
+											}
+											else
+											{
+												break;
+											}
+										}	// note : ループ終端
+
+                                        // 実際のデータ件数を入れなおす
+                                        m_dataCnt = readCnt;
+
+                                        // 最終ブロックをここで登録する
+                                        if (searchResultBuf.Tables[0].Rows.Count > 0 )
+                                        {
+                                            TrimStringTypeColumn(searchResultBuf.Tables[0]);
+                                            if (CompressDataSet(searchResultBuf, out searchResultComp))
+                                            {
+                                                writeCnt++;
+
+                                                // 分割結果をKarteSearchResultCache_TBLに書き込む
+                                                cmdWrite.Parameters.Clear();
+                                                cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+                                                cmdWrite.Parameters.Add("@SearchResultOrder", CanDbType.Integer).Value = writeCnt;
+                                                cmdWrite.Parameters.AddWithValue("@SearchResult", searchResultComp);
+                                                cmdWrite.Parameters.AddWithValue("@SearchResultKind", "F");
+                                                cmdWrite.Parameters.AddWithValue("@UserModified", loginId.ToUpper());
+                                                cmdWrite.ExecuteNonQuery();
+
+                                                // 作業用のデータセットのレコードを削除
+                                                searchResultBuf.Tables[0].Rows.Clear();
+                                            }
+                                            else
+                                            {
+                                                err.Code = CANWErrCode.System;
+                                            }
+                                        }
+
+                                        if (err.Code == CANWErrCode.Success)
+                                        {
+                                            //@@: KarteSearchHistory_TBLのDivisionCntを再登録する
+                                            cmdWrite.Parameters.Clear();
+                                            cmdWrite.CommandText = "update KarteSearchHistory_TBL set DivisionCnt = ? where SearchHistoryId = ? and TargetId = ?";
+
+                                            // 実際のデータ件数から分割数を求める
+                                            if (readCnt % m_divisionRange == 0)
+                                            {
+                                                m_divisionCnt = Convert.ToInt32(readCnt / m_divisionRange);
+                                            }
+                                            else
+                                            {
+                                                m_divisionCnt = Convert.ToInt32(readCnt / m_divisionRange) + 1;
+                                            }
+
+                                            cmdWrite.Parameters.Add("@DivisionCnt", CanDbType.Integer).Value = m_divisionCnt;
+                                            cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+                                            cmdWrite.Parameters.Add("@TargetId", CanDbType.Integer).Value = karteSearchSetting.TargetId;
+                                            cmdWrite.ExecuteNonQuery();
+                                        }
+									}
+									else
+									{
+										// 該当件数なし時はデータセットをフォーマットするのみ
+										CreateSearchResultBuff(dr, columnNameList, displayNameList, targetColumnTypes, numericDateTimeFormats, out searchResultBuf);
+										if (!m_cancelStatus)
+										{
+                                            cmdWrite.CommandText = "insert into KarteSearchResultCache_TBL (SearchHistoryId, SearchResultOrder, SearchResult, SearchResultKind, UserModified) values (?, ?, ?, ?, ?)";
+											TrimStringTypeColumn(searchResultBuf.Tables[0]);
+											if (CompressDataSet(searchResultBuf, out searchResultComp))
+											{
+												writeCnt++;
+                                                // 分割結果をKarteSearchResultCache_TBLに書き込む
+												cmdWrite.Parameters.Clear();
+												cmdWrite.Parameters.Add("@SearchHistoryId", CanDbType.Integer).Value = searchHistoryId;
+												cmdWrite.Parameters.Add("@SearchResultOrder", CanDbType.Integer).Value = writeCnt;
+                                                cmdWrite.Parameters.AddWithValue("@SearchResult", searchResultComp);
+                                                cmdWrite.Parameters.AddWithValue("@SearchResultKind", "F");
+												cmdWrite.Parameters.AddWithValue("@UserModified", loginId.ToUpper());
+												cmdWrite.ExecuteNonQuery();
+											}
+											else
+											{
+												err.Code = CANWErrCode.System;
+											}
+
+										}
+									}
+								}
+								else
+								{
+                                    // KarteSearchHistory_TBLに登録失敗
+									err.Code = CANWErrCode.System;
+								}
+							}
+							else
+							{
+								// 件数が多すぎる
+							}
+						}
+						else
+						{
+							err.Code = CANWErrCode.System;
+						}
+						if (dr != null) dr.Close();
+					}
+				}
+			}
+			catch (CanDbException ex)
+			{
+				// note : DB2の場合に問い合わせたSQLのコストが高いためDBの処理がタイムアウトするとこの例外が投げられることがあるのでここで対応する
+				if ((ex.Errors[0] != null) && (ex.Errors[0].SQLState == "HY008"))
+				{
+					err.Code = CANWErrCode.Timeout;
+                    err.Message = ex.Message;
+                    m_errStatus = true;			// @@ : 追加
+                    m_errMessage = ex.Message;			// @@ : 追加
+				}
+				// note : DB2の場合に問い合わせたSQLが長すぎるもしくは複雑すぎるとこの例外が投げられることがあるのでここで対応する
+				else if ((ex.Errors[0] != null) && (ex.Errors[0].SQLState == "54001"))
+				{
+					err.Code = CANWErrCode.TooLargeRequest;
+                    err.Message = ex.Message;
+                    m_errStatus = true;			// @@ : 追加
+                    m_errMessage = ex.Message;			// @@ : 追加
+				}
+				else
+				{
+					err.Code = CANWErrCode.System;
+                    err.Message = ex.Message;
+                    m_errStatus = true;			// @@ : 追加
+                    m_errMessage = ex.Message;			// @@ : 追加
+				}
+			}
+			catch (Exception ex)
+			{
+				err.Code = CANWErrCode.System;
+                err.Message = ex.Message;
+                m_errStatus = true;			// @@ : 追加
+                m_errMessage = ex.Message;			// @@ : 追加
+			}
+			finally
+			{
+				if (dr != null) dr.Close();
+				if (connWrite != null) connWrite.Close();
+				if (conn != null) conn.Close();
+			}
+			return err;
+        }
+
+        /// <summary>
+        /// セッションテーブルから分析用のレコードを削除する
+        /// </summary>
+        /// <param name="sessionId">セッションID</param>
+        private void DeleteSessionTbl(string sessionId)
+        {
+            CANWErr err = new CANWErr(CANWErrCode.Success);
+            CanDbConnection conn = new CanDbConnection(ClinicalKarteSearchCoreLibs.GetConnectionStringCan());
+            CanDbCommand cmd;
+            string sql;
+
+            try
+            {
+                conn.Open();
+                sql = "delete from session_Tbl where sessionId = ?";
+                cmd = new CanDbCommand(sql, conn, null);
+                cmd.Parameters.AddWithValue("@SessionId", sessionId);
+                if (cmd.ExecuteNonQuery() <= 0)
+                {
+                    err.Code = CANWErrCode.System;
+                    err.Message = " セッションテーブルからセッションID【" + sessionId + "】のレコードが削除できませんでした。";
+                }
+            }
+            catch (Exception ex)
+            {
+                err.Code = CANWErrCode.System;
+                err.Message = ex.Message;
+            }
+            finally
+            {
+                conn.Close();
+
+                if (err.Code != CANWErrCode.Success)
+                {
+                    ClinicalKarteSearchCoreLibs.WriteLog(System.Reflection.MethodInfo.GetCurrentMethod().Name, LogType.Error, err.Message);
+                }
+            }
+
+            return;
+        }
+
+        /// <summary>
+        /// 前回の検索結果から特定の列の絞り込みを行う
+        /// </summary>
+        /// <param name="dTable"></param>
+        /// <param name="columnName"></param>
+        /// <param name="whereInString"></param>
+        private void GetDistinctSearchData(DataTable dTable, string columnName, out string[] whereInString)
+        {
+            ArrayList arrayList = null;
+
+            whereInString = null;
+
+            if (dTable != null)
+            {
+                foreach (DataRow dRow in dTable.Rows)
+                {
+                    if (arrayList != null && arrayList.Count > 0)
+                    {
+                        for (int i = 0; i < arrayList.Count; i++)
+                        {
+                            if (arrayList[i].ToString() != dRow[columnName].ToString())
+                            {
+                                arrayList.Add(dRow[columnName].ToString());
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (arrayList == null)
+                        {
+                            arrayList = new ArrayList();
+                        }
+                        arrayList.Add(dRow[columnName].ToString());
+                    }
+                }
+
+                if (arrayList != null && arrayList.Count > 0)
+                {
+                    whereInString = (string[])arrayList.ToArray(typeof(string));
+                }
+            }
+
+            return;
+        }
+
+		/// <summary>
+		/// 検索結果データセットを初期化して作成する
+		/// </summary>
+		/// <param name="dr">リーダ</param>
+		/// <param name="columnNameList">項目名一覧</param>
+        /// <param name="displayNameList">表示名一覧</param>
+        /// <param name="targetColumnTypes">ターゲット項目型一覧</param>
+        /// <param name="numericDateTimeFormats">数値型日付フォーマット一覧</param>
+		/// <param name="searchResultBuff">検索結果</param>
+        private void CreateSearchResultBuff(CanDbDataReader dr, string[] columnNameList, string[] displayNameList, string[] targetColumnTypes, NumericDateTimeFormat[] numericDateTimeFormats, out DataSet searchResultBuff)
+		{
+			DataTable	dTable = new DataTable();
+			DataColumn	dColumn = new DataColumn();
+			int			i, ii;
+			bool		sameColumnNameStatus;
+
+			searchResultBuff = new DataSet();
+			dTable = searchResultBuff.Tables.Add();
+
+			i = 0;
+			for (i = 0; i < dr.FieldCount; i++)
+			{
+				dColumn = dTable.Columns.Add();
+				dColumn.ColumnName = dr.GetName(i);
+				dColumn.DataType = dr.GetFieldType(i);
+			}
+
+			i = ii = 0;
+			for (i = 0; i < dTable.Columns.Count; i++)
+			{
+				sameColumnNameStatus = false;
+				for (ii = 0; ii < columnNameList.Length; ii++)
+				{
+					if (dTable.Columns[i].ColumnName.ToUpper().Trim() == columnNameList[ii].Trim())
+					{
+						dTable.Columns[i].Caption = displayNameList[ii];
+
+                        // 数値型日付の場合は型を修正
+                        if (targetColumnTypes[ii] == "DATE")
+                        {
+                            // フォーマットが存在したら日付型に変更する
+// ToDo : DEV_CAN-1920 で、年2桁フォーマットについては、問題が発生したため、対応しないこととする。
+//   (2000年01月10日を扱おうとするとでーたとしては 110 となってしまい、補正する必要があるが対応する時間がない。)
+// ToDo : DEV_CAN-1920 で、時刻のみのフォーマットについては TargetBuilder で選択できないようにしたため、テストは実施していない。
+                            if (numericDateTimeFormats[ii] == NumericDateTimeFormat.yyMMdd ||
+                                    numericDateTimeFormats[ii] == NumericDateTimeFormat.yyyyMMdd ||
+                                    numericDateTimeFormats[ii] == NumericDateTimeFormat.yyMMddHHmmss ||
+                                    numericDateTimeFormats[ii] == NumericDateTimeFormat.yyyyMMddHHmmss ||
+                                    numericDateTimeFormats[ii] == NumericDateTimeFormat.HHmmss)
+                            {
+                                dTable.Columns[i].DataType = typeof(DateTime);
+                            }
+                        }
+
+						sameColumnNameStatus = true;
+						break;
+					}
+					if (!sameColumnNameStatus)
+					{
+						dTable.Columns[i].Caption = dTable.Columns[i].ColumnName;
+					}
+				}
+			}
+
+			return;
+        }
+
+        /// <summary>
+        /// 検索結果データセットを初期化して作成する
+        /// note: バックグラウンド検索用
+        /// </summary>
+        /// <param name="dr"></param>
+        /// <param name="columnNameList"></param>
+        /// <param name="displayNameList"></param>
+        /// <param name="searchResultBuff"></param>
+        private void CreateSearchResultBuff(CanDbDataReader dr, string[] columnNameList, string[] displayNameList, out DataTable dTable)
+        {
+            //DataTable dTable = new DataTable();
+            DataColumn dColumn = new DataColumn();
+            int i, ii;
+            bool sameColumnNameStatus;
+
+            dTable = new DataTable();
+
+            i = 0;
+            for (i = 0; i < dr.FieldCount; i++)
+            {
+                dColumn = dTable.Columns.Add();
+                dColumn.ColumnName = dr.GetName(i);
+                dColumn.DataType = dr.GetFieldType(i);
+            }
+
+            i = ii = 0;
+            for (i = 0; i < dTable.Columns.Count; i++)
+            {
+                sameColumnNameStatus = false;
+                for (ii = 0; ii < columnNameList.Length; ii++)
+                {
+                    if (dTable.Columns[i].ColumnName.ToUpper().Trim() == columnNameList[ii].Trim())
+                    {
+                        dTable.Columns[i].Caption = displayNameList[ii];
+                        sameColumnNameStatus = true;
+                        break;
+                    }
+                    if (!sameColumnNameStatus)
+                    {
+                        dTable.Columns[i].Caption = dTable.Columns[i].ColumnName;
+                    }
+                }
+            }
+
+            return;
+        }
+
+		/// <summary>
+		/// 指定ターゲットのカラム名と表示名を同期して取得する
+		/// </summary>
+		/// <param name="conn">オープン済みのDBコネクション</param>
+		/// <param name="targetId">該当ターゲットID</param>
+		/// <param name="columnNameList">[out]カラム名リスト</param>
+        /// <param name="displayNameList">[out]表示名リスト</param>
+        /// <param name="targetColumnTypes">ターゲット項目型一覧</param>
+        /// <param name="numericDateTimeFormats">数値型日付フォーマット一覧</param>
+		/// <param name="originalColumnTypes">元のデータ型一覧</param>
+		private void GetDisplayNameList(CanDbConnection conn,
+                                            long targetId,
+                                            out string[] columnNameList,
+                                            out string[] displayNameList,
+                                            out string[] targetColumnTypes,
+                                            out NumericDateTimeFormat[] numericDateTimeFormats,
+											out string[] originalColumnTypes)
+		{
+			CanDbCommand		cmd;
+			CanDbDataReader		dr = null;
+			ArrayList			columnNameBuff, displayNameBuff;
+
+			columnNameList = null;
+			displayNameList = null;
+            targetColumnTypes = null;
+            numericDateTimeFormats = null;
+			originalColumnTypes = null;
+
+			columnNameBuff = new ArrayList();
+			displayNameBuff = new ArrayList();
+
+            var targetColumnTypesBuffer = new List<string>();
+            var numericDateTimeFormatsBuffer = new List<NumericDateTimeFormat>();
+			List<string> originalColumnTypesBuffer = new List<string>();
+
+			cmd = new CanDbCommand("", conn, null);
+			cmd.CommandText = "select ColumnName, DisplayName, ColumnType, NumericDateTimeFormat from TargetColumn_TBL where TargetId = ?";
+			cmd.Parameters.Add("@TargetId", CanDbType.Integer).Value = targetId;
+			dr = cmd.ExecuteReader();
+			if (dr.HasRows)
+			{
+				while (dr.Read())
+				{
+					columnNameBuff.Add(dr["ColumnName"].ToString().ToUpper());
+					displayNameBuff.Add(dr["DisplayName"].ToString());
+					originalColumnTypesBuffer.Add(dr["ColumnType"].ToString().ToUpper());
+
+                    switch (dr["ColumnType"].ToString().ToUpper())
+                    {
+                        case "STRING":
+                        case "VALUE":
+                            switch (dr["NumericDateTimeFormat"].ToString().ToUpper())
+                            {
+                                // 設定なし→数値
+                                case "NONE":
+                                    targetColumnTypesBuffer.Add(dr["ColumnType"].ToString().ToUpper());
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.None);
+                                    break;
+// ToDo : DEV_CAN-1920 で、年2桁フォーマットについては、問題が発生したため、対応しないこととする。
+// (2000年01月10日を扱おうとするとでーたとしては 110 となってしまい、補正する必要があるが対応する時間がない。)
+                                // 数値型日付
+                                case "YYMMDD":
+                                    targetColumnTypesBuffer.Add("DATE");
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.yyMMdd);
+                                    break;
+                                // 数値型日付
+                                case "YYYYMMDD":
+                                    targetColumnTypesBuffer.Add("DATE");
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.yyyyMMdd);
+                                    break;
+// ToDo : DEV_CAN-1920 で、年2桁フォーマットについては、問題が発生したため、対応しないこととする。
+// (2000年01月10日を扱おうとするとでーたとしては 110 となってしまい、補正する必要があるが対応する時間がない。)
+                                // 数値型日付
+                                case "YYMMDDHHMMSS":
+                                    targetColumnTypesBuffer.Add("DATE");
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.yyMMddHHmmss);
+                                    break;
+                                // 数値型日付
+                                case "YYYYMMDDHHMMSS":
+                                    targetColumnTypesBuffer.Add("DATE");
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.yyyyMMddHHmmss);
+                                    break;
+// ToDo : DEV_CAN-1920 で、時刻のみのフォーマットについては TargetBuilder で選択できないようにしたため、テストは実施していない。
+                                // 数値型日付
+                                case "HHMMSS":
+                                    targetColumnTypesBuffer.Add("DATE");
+                                    numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.HHmmss);
+                                    break;
+                            }
+                            break;
+                        case "DATE":
+                            targetColumnTypesBuffer.Add(dr["ColumnType"].ToString().ToUpper());
+                            numericDateTimeFormatsBuffer.Add(NumericDateTimeFormat.None);
+                            break;
+                    }
+				}
+			}
+			if (dr != null) dr.Close();
+			if (columnNameBuff.Count > 0)
+			{
+				columnNameList = new string[columnNameBuff.Count];
+				columnNameBuff.CopyTo(columnNameList);
+			}
+			if (displayNameBuff.Count > 0)
+			{
+				displayNameList = new string[displayNameBuff.Count];
+                displayNameBuff.CopyTo(displayNameList);
+                targetColumnTypes = targetColumnTypesBuffer.ToArray();
+                numericDateTimeFormats = numericDateTimeFormatsBuffer.ToArray();
+				originalColumnTypes = originalColumnTypesBuffer.ToArray();
+			}
+			return;
+		}
+
+        /// <summary>
+        /// 指定ターゲットの表示名を同期して取得する
+        /// </summary>
+        /// <param name="conn">オープン済みのDBコネクション</param>
+        /// <param name="targetId">該当ターゲットID</param>
+        /// <returns>ターゲット名</returns>
+        private string GetTargetDisplayName(CanDbConnection conn, long targetId)
+        {
+            CanDbCommand cmd;
+            CanDbDataReader dr = null;
+
+            string displayName = "";
+
+            cmd = new CanDbCommand("", conn, null);
+            cmd.CommandText = "select DisplayName from Target_TBL where TargetId = ?";
+            cmd.Parameters.Add("@TargetId", CanDbType.Integer).Value = targetId;
+            dr = cmd.ExecuteReader();
+            if (dr.HasRows)
+            {
+                while (dr.Read())
+                {
+                     displayName = dr["DisplayName"].ToString();
+                }
+            }
+            if (dr != null) dr.Close();
+
+            return displayName;
+        }
+
+        /// <summary>
+        /// ユーザー名取得
+        /// </summary>
+        /// <param name="conn">オープン済みのDBコネクション</param>
+        /// <param name="userId">ユーザーID</param>
+        /// <returns>ユーザー名</returns>
+        private string GetUserName(CanDbConnection conn, long userId)
+        {
+            CanDbCommand cmd;
+            CanDbDataReader dr = null;
+
+            string userName = "";
+
+            cmd = new CanDbCommand("", conn, null);
+            cmd.CommandText = "select Name from User_TBL where UserId = ?";
+            cmd.Parameters.Add("@UserId", CanDbType.Integer).Value = userId;
+            dr = cmd.ExecuteReader();
+            if (dr.HasRows)
+            {
+                while (dr.Read())
+                {
+                    userName = dr["Name"].ToString();
+                }
+            }
+            if (dr != null) dr.Close();
+
+            return userName;
+        }
+
+        /// <summary>
+		/// 文字列型のカラムのデータをトリミングする
+		/// </summary>
+		/// <param name="dataTable">トリミングをするデータテーブル</param>
+		private void TrimStringTypeColumn(DataTable dataTable)
+		{
+			int		row, col;
+
+			for (col = 0; col < dataTable.Columns.Count; col++)
+			{
+				if (dataTable.Columns[col].DataType == System.Type.GetType("String"))
+				{
+					for (row = 0; row < dataTable.Rows.Count; row++)
+					{
+						dataTable.Rows[row][col] = (dataTable.Rows[row][col] != null) ? dataTable.Rows[row][col].ToString().Trim() : "";
+					}
+				}
+			}
+			return;
+		}
+
+		/// <summary>
+		/// DataSetを圧縮して返す
+		/// </summary>
+		/// <param name="dataSet">データセット</param>
+		/// <param name="dataSetComp">圧縮されたデータセット</param>
+		/// <returns></returns>
+		private bool CompressDataSet(DataSet dataSet, out byte[] dataSetComp)
+		{
+			bool		retValue = true;
+			string		dataSetXml;
+			dataSetComp = null;
+
+			SerializeDataSet(dataSet, out dataSetXml);
+
+			retValue = ArcLib.CompressZipData(System.Text.Encoding.GetEncoding(932).GetBytes(dataSetXml), out dataSetComp);
+			return retValue;
+		}
+
+		/// <summary>
+		/// DataSetタイプのオブジェクトをシリアライズする
+		/// </summary>
+		/// <param name="dataSet">データセット</param>
+		/// <param name="dataSetXml">[out]シリアライズされたデータセット</param>
+		private void SerializeDataSet(DataSet dataSet, out string dataSetXml)
+		{
+			TextWriter		tw = new StringWriter();
+			XmlSerializer	serializer;
+
+			dataSetXml = "";
+
+			serializer = new XmlSerializer(typeof(DataSet));
+			serializer.Serialize(tw, dataSet);
+			dataSetXml = tw.ToString();
+
+			return;
+		}
+	}
+}
